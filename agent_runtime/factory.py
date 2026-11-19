@@ -51,7 +51,24 @@ class ExecutableAgent:
         return await self.runtime.resume(self, session_id)
 
 
-def create_agent(definition, runtime):
+def _build_state_schema(state_fields: tuple[str, ...]) -> type[AgentState]:
+    reserved = set(get_type_hints(AgentState)) | {"session_id", "thread_id", "checkpoint_id",
+                                                  "attempt_id", "last_committed", "current_attempt"}
+    fields = {}
+    for i, key in enumerate(state_fields):
+        if not key.isidentifier() or key.startswith("_") or key in reserved or key in fields:
+            raise InvalidDefinition(f"state_fields[{i}]: invalid field {key!r}")
+        fields[key] = str
+    # 把自定义字段作为可选字段并入图状态，旧检查点可以缺少这些字段。
+    extra = TypedDict("Extra", fields, total=False)
+
+    class State(AgentState, extra):
+        """本次执行图的状态结构，合并 LangChain AgentState 的消息历史与当前定义声明的可选字段。"""
+
+    return State
+
+
+def create_agent(definition: AgentDefinition, runtime) -> ExecutableAgent:
     versions = {}
     def resolve(group, field, key):
         try:
@@ -68,23 +85,19 @@ def create_agent(definition, runtime):
     for i, hook in enumerate(hooks):
         if not isinstance(hook, (Hook, AgentMiddleware)):
             raise InvalidDefinition(f"hook_refs[{i}]: expected Hook or AgentMiddleware")
-    reserved = set(get_type_hints(AgentState)) | {"session_id", "thread_id", "checkpoint_id",
-                                                  "attempt_id", "last_committed", "current_attempt"}
-    fields = {}
-    for i, key in enumerate(definition.state_fields):
-        if not key.isidentifier() or key.startswith("_") or key in reserved or key in fields:
-            raise InvalidDefinition(f"state_fields[{i}]: invalid field {key!r}")
-        fields[key] = str
-    # 把自定义字段作为可选字段并入图状态，旧检查点可以缺少这些字段。
-    extra = TypedDict("Extra", fields, total=False)
-    class State(AgentState, extra):
-        """本次执行图的状态结构，合并 LangChain AgentState 的消息历史与当前定义声明的可选字段。"""
+    state_schema = _build_state_schema(definition.state_fields)
 
     # LangChain 构建模型与工具之间的循环。Dispatch 执行框架的 Hook，原生中间件交给 LangChain。
-    graph = compile_agent(model, tools, middleware=[Dispatch(runtime, list(zip(definition.hook_refs, hooks))),
-                                      *(h for h in hooks if isinstance(h, AgentMiddleware))],
-                          state_schema=State, system_prompt=definition.system_prompt,
-                          checkpointer=runtime.saver)
+    middleware = [Dispatch(runtime, list(zip(definition.hook_refs, hooks)))]
+    middleware.extend(hook for hook in hooks if isinstance(hook, AgentMiddleware))
+    graph = compile_agent(
+        model,
+        tools,
+        middleware=middleware,
+        state_schema=state_schema,
+        system_prompt=definition.system_prompt,
+        checkpointer=runtime.saver,
+    )
     # 指纹覆盖定义、组件选择和声明版本。更换组件实现时需要同步更新版本。
     payload = json.dumps([asdict(definition), versions], sort_keys=True).encode()
     return ExecutableAgent(graph, runtime, sha256(payload).hexdigest())
