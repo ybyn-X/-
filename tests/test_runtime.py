@@ -9,7 +9,7 @@ import time
 from uuid import uuid4
 
 import pytest
-from agent_runtime import DefinitionMismatch, InvalidDefinition, SessionExists, create_agent
+from agent_runtime import DefinitionMismatch, InvalidDefinition, OutcomeUnknown, SessionBusy, SessionExists, create_agent
 from .scenario import build
 
 
@@ -34,7 +34,7 @@ def test_factory_and_execution(tmp_path):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("mode", ["committed", "queued", "waiting"])
+@pytest.mark.parametrize("mode", ["committed", "queued", "waiting", "final", "both"])
 def test_real_restart(tmp_path, mode):
     value = uuid4().hex
     (tmp_path / "value").write_text(value)
@@ -47,7 +47,8 @@ def test_real_restart(tmp_path, mode):
             while not (tmp_path / "ready").exists():
                 assert proc.poll() is None and time.monotonic() < deadline
                 time.sleep(.02)
-            assert not (tmp_path / "B").exists()
+            if mode not in {"both", "final"}:
+                assert not (tmp_path / "B").exists()
     finally:
         if proc.poll() is None:
             pid_file = tmp_path / 'worker.pid'
@@ -62,11 +63,25 @@ def test_real_restart(tmp_path, mode):
         try:
             info = await rt.inspect("original")
             assert info["status"] == "interrupted"
-            assert not (tmp_path / "B").exists()
+            if mode not in {"both", "final"}:
+                assert not (tmp_path / "B").exists()
             if mode == "waiting":
                 assert info["last_committed"]["step"] == "model_tool_request"
                 assert info["current_attempt"]["target"] == "lookup"
                 assert rt.history("original")["events"][-1]["kind"] == "interrupted"
+                for _ in range(2):
+                    with pytest.raises(OutcomeUnknown) as caught:
+                        await agent.resume("original")
+                    assert caught.value.args[1] == "call-1"
+                assert info["current_attempt"]["call_id"] == "call-1"
+                assert (tmp_path / "A").read_text().splitlines() == ["called"]
+                return
+            if mode == "final":
+                before = (tmp_path / "models").read_bytes()
+                assert await (await agent.resume("original")).wait() == value
+                assert (await rt.inspect("original"))["status"] == "completed"
+                assert (tmp_path / "models").read_bytes() == before
+                assert (tmp_path / "A").read_text().splitlines() == ["called"]
                 return
             if mode == "committed":
                 assert info["last_committed"]["step"] == "tool_result"
@@ -77,6 +92,15 @@ def test_real_restart(tmp_path, mode):
                 changed = create_agent(other, rt)
                 with pytest.raises(DefinitionMismatch):
                     await changed.resume("original")
+            if mode == "both":
+                first, second = await asyncio.gather(agent.resume("original"), agent.resume("original"),
+                                                     return_exceptions=True)
+                assert isinstance(second, SessionBusy)
+                assert await first.wait() == value
+                assert (await rt.inspect("finished"))["result"] == value
+                assert (tmp_path / "A").read_text().splitlines() == ["called", "called"]
+                assert len((tmp_path / "models").read_text().splitlines()) == 4
+                return
             handle = await agent.resume("original")
             assert await handle.wait() == value
             assert (tmp_path / "B").read_text() == value

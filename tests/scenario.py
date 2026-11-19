@@ -39,7 +39,7 @@ class Model(BaseChatModel):
 
 async def build(path, mode="normal", version="1"):
     @tool
-    async def lookup() -> str:
+    async def lookup(suffix: str = "") -> str:
         """Return a unique durable receipt."""
         if mode == "tool_error":
             raise RuntimeError("test-secret")
@@ -48,7 +48,7 @@ async def build(path, mode="normal", version="1"):
         if mode == "waiting":
             (path / "ready").touch()
             await asyncio.Event().wait()
-        return (path / "value").read_text()
+        return (path / "value").read_text() + suffix
 
     registry = {"models": {"model": Component(version, Model(directory=str(path), mode=mode))},
                 "tools": {"lookup": Component("1", lookup)}, "hooks": {}}
@@ -64,12 +64,15 @@ async def build(path, mode="normal", version="1"):
 async def worker(path, mode):
     (path / 'worker.pid').write_text(str(os.getpid()))
     rt, agent, _ = await build(path, mode)
-    if mode == "committed":
+    if mode in {"committed", "final", "both"}:
+        if mode == "both":
+            await (await agent.start("finished", "other")).wait()
         put = rt.saver.aput
         async def persist(config, checkpoint, metadata, versions):
             result = await put(config, checkpoint, metadata, versions)
             msgs = checkpoint["channel_values"].get("messages", [])
-            if msgs and isinstance(msgs[-1], ToolMessage):
+            if msgs and (isinstance(msgs[-1], ToolMessage) if mode != "final" else
+                         isinstance(msgs[-1], AIMessage) and not msgs[-1].tool_calls):
                 (path / "ready").touch()
                 await asyncio.Event().wait()
             return result

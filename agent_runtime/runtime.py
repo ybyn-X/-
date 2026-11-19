@@ -13,22 +13,27 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 
 class SessionExists(ValueError):
-    pass
+    """start 使用了数据库里已有的 session ID。已完成的会话可通过 send 追加消息。"""
 
 
 class DefinitionMismatch(ValueError):
-    pass
+    """续聊或恢复时，当前 Agent 指纹与创建 session 时保存的指纹不同。"""
 
 
 class SessionBusy(RuntimeError):
-    pass
+    """session 当前无法接受操作，例如执行尚未结束，或当前状态不允许 send 或 resume。"""
 
 
 class OutcomeUnknown(RuntimeError):
-    pass
+    """恢复时发现工具调用已开始，但检查点无法确认结果。异常携带 session、调用和尝试标识，供核对外部效果。"""
+
+
+class CheckpointError(RuntimeError):
+    """执行检查点缺失、损坏或无法读取，运行时无法据此判断安全的恢复位置。"""
 
 
 def config(sid):
+    # LangGraph 以 thread_id 查找检查点，因此同一 session 的每一轮都使用同一个 sid。
     return {"configurable": {"thread_id": sid, "checkpoint_ns": ""}}
 
 
@@ -38,6 +43,7 @@ def now():
 
 @dataclass
 class Handle:
+    """代表一次已调度的执行。wait 等待本次结果；调用方取消等待时，底层执行任务仍可继续。"""
     session_id: str
     _task: asyncio.Task
 
@@ -46,6 +52,7 @@ class Handle:
 
 
 class Runtime:
+    """管理同一数据库上的 session、后台任务和检查点。负责调度执行、记录状态，以及在进程重启后恢复中断的工作。"""
     @classmethod
     async def open(cls, path, registry):
         self = cls()
@@ -53,6 +60,7 @@ class Runtime:
         self.active = {}
         self.closed = False
         self.gate = asyncio.Lock()
+        # 持锁期间只有本进程可以接管数据库中的 session，避免两个运行时同时恢复同一任务。
         self.lock = FileLock(str(Path(path).resolve()) + ".lock", timeout=0)
         self.lock.acquire()
         try:
@@ -63,15 +71,20 @@ class Runtime:
                 CREATE TABLE IF NOT EXISTS sessions (
                   sid TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, input TEXT NOT NULL,
                   status TEXT NOT NULL, result TEXT, error TEXT);
+                CREATE TABLE IF NOT EXISTS followups (
+                  sid TEXT PRIMARY KEY, base_checkpoint TEXT NOT NULL, message TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS events (
                   seq INTEGER PRIMARY KEY, sid TEXT NOT NULL, time TEXT NOT NULL,
                   kind TEXT NOT NULL, attempt_id TEXT, step TEXT, target TEXT, error TEXT);
                 CREATE INDEX IF NOT EXISTS events_by_session ON events(sid,seq);
             """)
+            if "call_id" not in {r["name"] for r in self.db.execute("PRAGMA table_info(events)")}:
+                self.db.execute("ALTER TABLE events ADD COLUMN call_id TEXT")
             self.conn = await aiosqlite.connect(path)
             self.saver = AsyncSqliteSaver(self.conn)
             await self.saver.setup()
             with self.db:
+                # 上一个运行时遗留的排队或运行中任务，在新进程里标为中断，等待显式恢复。
                 for row in self.db.execute("SELECT sid FROM sessions WHERE status IN ('running','queued')").fetchall():
                     self.status(row["sid"], "interrupted")
             return self
@@ -83,19 +96,19 @@ class Runtime:
             self.lock.release()
             raise
 
-    def event(self, sid, kind, attempt=None, step=None, target=None, error=None):
-        self.db.execute("INSERT INTO events(sid,time,kind,attempt_id,step,target,error) VALUES(?,?,?,?,?,?,?)",
-                        (sid, now(), kind, attempt, step, target, error))
+    def event(self, sid, kind, attempt=None, step=None, target=None, error=None, call_id=None):
+        self.db.execute("INSERT INTO events(sid,time,kind,attempt_id,step,target,error,call_id) VALUES(?,?,?,?,?,?,?,?)",
+                        (sid, now(), kind, attempt, step, target, error, call_id))
 
     def status(self, sid, value, error=None, result=None):
         self.db.execute("UPDATE sessions SET status=?,error=?,result=? WHERE sid=?",
                         (value, error, json.dumps(result) if result is not None else None, sid))
         self.event(sid, value, error=error)
 
-    def begin(self, sid, step, target):
+    def begin(self, sid, step, target, call_id=None):
         attempt = uuid4().hex
         with self.db:
-            self.event(sid, "attempt_started", attempt, step, target)
+            self.event(sid, "attempt_started", attempt, step, target, call_id=call_id)
         return attempt
 
     def end(self, sid, attempt, error=None):
@@ -150,6 +163,38 @@ class Runtime:
         finally:
             self.active.pop(sid, None)
 
+    async def checkpoint(self, sid):
+        try:
+            cp = await self.saver.aget_tuple(config(sid))
+            if cp is not None:
+                state = cp.checkpoint
+                if not isinstance(state, dict) or not isinstance(state.get("id"), str) or not isinstance(state.get("channel_values"), dict):
+                    raise ValueError("invalid persisted checkpoint structure")
+        except Exception as exc:
+            raise CheckpointError(sid) from exc
+        if cp is None and self.db.execute(
+            "SELECT 1 FROM events WHERE sid=? AND kind='attempt_started' LIMIT 1", (sid,)
+        ).fetchone():
+            raise CheckpointError(f"{sid}: missing checkpoint after execution began")
+        return cp
+
+    async def send(self, agent, sid, message):
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("expected a non-empty message")
+        async with self.gate:
+            row = self.session(sid)
+            if row["fingerprint"] != agent.fingerprint:
+                raise DefinitionMismatch(sid)
+            if self.closed or sid in self.active or row["status"] != "completed":
+                raise SessionBusy(sid)
+            cp = await self.checkpoint(sid)
+            with self.db:
+                # 先在同一事务保存新消息和上轮检查点，再调度执行。恢复时据此判断是否需要重新提交输入。
+                self.db.execute("INSERT OR REPLACE INTO followups VALUES(?,?,?)",
+                                (sid, cp.checkpoint["id"], message))
+                self.status(sid, "queued")
+            return self.schedule(agent, sid, {"messages": [("user", message)]})
+
     async def resume(self, agent, sid):
         async with self.gate:
             if self.closed:
@@ -159,12 +204,20 @@ class Runtime:
                 raise DefinitionMismatch(sid)
             if sid in self.active or row["status"] != "interrupted":
                 raise SessionBusy(sid)
-            cp = await self.saver.aget_tuple(config(sid))
+            cp = await self.checkpoint(sid)
             payload = None if cp else {"messages": [("user", row["input"])]}
-            if cp:
-                snapshot = await agent.graph.aget_state(config(sid))
+            followup = self.db.execute("SELECT * FROM followups WHERE sid=?", (sid,)).fetchone()
+            # 最新检查点仍是上轮终点，说明新消息尚未写入图检查点，需要再次提交。
+            if followup and cp and followup["base_checkpoint"] == cp.checkpoint["id"]:
+                payload = {"messages": [("user", followup["message"])]}
+            elif cp:
+                try:
+                    snapshot = await agent.graph.aget_state(config(sid))
+                except Exception as exc:
+                    raise CheckpointError(sid) from exc
                 messages = snapshot.values.get("messages", [])
-                if not snapshot.next and messages and isinstance(messages[-1], AIMessage):
+                # 图可能已经写入最终回答，进程却来不及更新 session 状态。直接采用已保存的结果。
+                if not snapshot.next and messages and isinstance(messages[-1], AIMessage) and not messages[-1].tool_calls:
                     result = messages[-1].content
                     with self.db:
                         self.status(sid, "completed", result=result)
@@ -173,16 +226,18 @@ class Runtime:
                     last_model = self.db.execute(
                         "SELECT max(seq) FROM events WHERE sid=? AND step='model' AND kind='attempt_returned'",
                         (sid,)).fetchone()[0] or 0
-                    if self.db.execute("SELECT 1 FROM events WHERE sid=? AND seq>? AND step='tool' LIMIT 1",
-                                       (sid, last_model)).fetchone():
-                        raise OutcomeUnknown(sid)
+                    intent = self.db.execute("SELECT attempt_id, call_id FROM events WHERE sid=? AND seq>? AND step='tool' AND kind='attempt_started' LIMIT 1",
+                                       (sid, last_model)).fetchone()
+                    # 工具可能已产生外部副作用，但检查点还没有结果；自动重放可能重复执行。
+                    if intent:
+                        raise OutcomeUnknown(sid, intent["call_id"], intent["attempt_id"])
             with self.db:
                 self.event(sid, "resume_requested")
             return self.schedule(agent, sid, payload)
 
     async def inspect(self, sid):
         self.session(sid)
-        cp = await self.saver.aget_tuple(config(sid))
+        cp = await self.checkpoint(sid)
         committed = None
         if cp:
             messages = cp.checkpoint["channel_values"].get("messages", [])
