@@ -1,0 +1,19 @@
+[model]
+ref = "langchain_openai:ChatOpenAI"
+model = "gpt-4.1-mini"
+temperature = 0.2
+
+[metadata]
+description = "Minimal coding agent modeled after Pi with 4 core tools: read, write, edit, bash."
+
+[tools]
+read = "tools.filesystem:read_file"
+write = "tools.filesystem:write_file"
+edit = "tools.filesystem:str_replace"
+bash = "tools.shell:bash"
+
+[[middleware]]
+ref = "middleware.tool_errors:ToolErrorMiddleware"
+
+[[middleware]]
+ref = "middleware.observability:ObservabilityMiddleware"

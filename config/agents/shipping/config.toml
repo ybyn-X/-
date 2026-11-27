@@ -1,0 +1,9 @@
+skills = ["../../../skills/shipping/SKILL.md"]
+
+[model]
+ref = "langchain_openai:ChatOpenAI"
+model = "gpt-4.1-mini"
+temperature = 0.2
+
+[tools]
+shipping_fee = "tools.shipping:shipping_fee"

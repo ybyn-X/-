@@ -1,0 +1,21 @@
+[model]
+ref = "langchain_openai:ChatOpenAI"
+model = "gpt-4.1-mini"
+temperature = 0.2
+
+[tools]
+list_directory = "tools.filesystem:list_directory"
+read_file = "tools.filesystem:read_file"
+write_file = "tools.filesystem:write_file"
+str_replace = "tools.filesystem:str_replace"
+tool_research = "tools.tool_research:tool_research"
+
+[[middleware]]
+ref = "middleware.tool_errors:ToolErrorMiddleware"
+
+[[middleware]]
+ref = "middleware.deferred_middleware:DeferredMiddleware"
+deferred_names = ["write_file", "str_replace"]
+
+[[middleware]]
+ref = "langchain.agents.middleware:TodoListMiddleware"
